@@ -78,6 +78,22 @@ Notes:
 - Direct `.ipa` input is not supported yet; extract the files as above.
 - Building needs recent Xcode Command Line Tools. If the build fails with an "outdated Command Line Tools" error, update them in System Settings → Software Update.
 
+### Using this branch on a machine that already has blutter
+If you already cloned the default blutter, you do not need to overwrite it. Add this repository as a remote and switch branch:
+```
+cd /path/to/blutter
+git status                      # make sure there are no local changes you need
+git remote add mine https://github.com/24h7d/blutter-ios-support.git
+git fetch mine
+git checkout -b ios-support mine/ios-support
+```
+`bin/` and `build/` are not tracked by git, so existing Android builds are kept; only the iOS build is compiled on first use. If checkout refuses because of local changes, use `git stash` first (avoid `git checkout -f` / `git reset --hard`). To go back to the default version: `git checkout main`.
+
+For a fresh machine, clone directly:
+```
+git clone -b ios-support https://github.com/24h7d/blutter-ios-support.git blutter
+```
+
 ## Update
 You can use ```git pull``` to update and run blutter.py with ```--rebuild``` option to force rebuild the executable
 ```
