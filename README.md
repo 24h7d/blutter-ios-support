@@ -1,7 +1,7 @@
 # B(l)utter
 Flutter Mobile Application Reverse Engineering Tool by Compiling Dart AOT Runtime
 
-Currently the application supports only Android libapp.so (arm64 only).
+Currently the application supports Android libapp.so (arm64) and, on this branch, iOS `App` (Mach-O arm64). See [iOS Usage](#ios-usage).
 Also the application is currently work only against recent Dart versions.
 
 For high priority missing features, see [TODO](#todo)
@@ -56,6 +56,27 @@ python3 blutter.py path/to/app/lib/arm64-v8a out_dir
 The blutter.py will automatically detect the Dart version from the flutter engine and call executable of blutter to get the information from libapp.so.
 
 If the blutter executable for required Dart version does not exists, the script will automatically checkout Dart source code and compiling it.
+
+## iOS Usage
+This branch adds support for iOS Flutter apps (arm64 Mach-O, thin or FAT/universal).
+
+1. Get the decrypted `.ipa` and unzip it (an `.ipa` is a zip file). App Store binaries are FairPlay-encrypted, so you must dump a decrypted copy from a jailbroken device first.
+2. Copy the two Flutter binaries into one directory:
+```
+mkdir ios_in
+cp Payload/<Name>.app/Frameworks/App.framework/App ios_in/App
+cp Payload/<Name>.app/Frameworks/Flutter.framework/Flutter ios_in/Flutter
+```
+3. Run blutter on that directory:
+```
+python3 blutter.py ios_in out_dir
+```
+blutter detects the Dart version from `Flutter` and picks the iOS build (`blutter_dartvm<ver>_ios_arm64`). On the first run for each Dart version it fetches and compiles the Dart SDK, which takes a while and needs internet access.
+
+Notes:
+- Only arm64 is supported. Apps without compressed pointers get a separate `_no-compressed-ptrs` build automatically.
+- Direct `.ipa` input is not supported yet; extract the files as above.
+- Building needs recent Xcode Command Line Tools. If the build fails with an "outdated Command Line Tools" error, update them in System Settings → Software Update.
 
 ## Update
 You can use ```git pull``` to update and run blutter.py with ```--rebuild``` option to force rebuild the executable
