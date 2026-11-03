@@ -83,6 +83,12 @@ constexpr arm64_reg CSREG_DART_THR = ToCapstoneReg(dart::THR);
 constexpr arm64_reg CSREG_DART_PP = ToCapstoneReg(dart::PP);
 #if defined(DART_COMPRESSED_POINTERS)
 constexpr arm64_reg CSREG_DART_HEAP = ToCapstoneReg(dart::HEAP_BITS);
+#else
+// No heap-base register exists without compressed pointers (object pointers
+// are full 64-bit and never decompressed via an add+shift idiom). Use an
+// invalid register sentinel so comparisons against it are always false
+// instead of failing to compile.
+constexpr arm64_reg CSREG_DART_HEAP = ARM64_REG_INVALID;
 #endif
 constexpr arm64_reg CSREG_DART_TMP = ToCapstoneReg(dart::TMP);
 constexpr arm64_reg CSREG_DART_TMP2 = ToCapstoneReg(dart::TMP2);

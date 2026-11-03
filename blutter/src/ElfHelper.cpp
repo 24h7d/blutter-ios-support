@@ -3,12 +3,12 @@
 PRAGMA_WARNING(push, 0)
 #include <platform/elf.h>
 #if defined(DART_TARGET_OS_MACOS)
-// old dart version has no mach_o.h
-//#include <platform/mach_o.h>
+#include <platform/mach_o.h>
 #endif
 PRAGMA_WARNING(pop)
 #include <algorithm>
 #include <stdexcept>
+#include <vector>
 #if defined(_WIN32) || defined(WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -153,22 +153,118 @@ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
 	// quick and dirty parsing ELF to get symbol addresses
 	uint8_t* elf = (uint8_t*)(lib);
 #if defined(DART_TARGET_OS_MACOS)
-	// Note: only new dart version getting snapshots from load command
-	// <=2.17, use EXPORT name
-	// <= v2.18,  load from sub SEGMENT_64, named "__CUSTOM" and section named "__dart_app_snap"
-	// >= 2.19, LC_NOTE command is used
-	auto header = (dart::mach_o::mach_header_64*)lib;
-	switch (header->magic) {
-	case dart::mach_o::MH_MAGIC:
-	case dart::mach_o::MH_CIGAM:
-		throw std::invalid_argument("Mach-O: Support only 64 bits");
-	case dart::mach_o::MH_CIGAM_64:
-		throw std::invalid_argument("Mach-O: Expected a host endian header");
-	case dart::mach_o::MH_MAGIC_64:
-		return size >= sizeof(mach_o::mach_header_64);
-	default:
-		throw std::invalid_argument("Mach-O: Invalid magic header");
+	// quick and dirty parsing of Mach-O to get Dart snapshot symbol addresses.
+	// The file is mmap'd flat (load_map_file), so like the ELF path above we
+	// translate a symbol's vmaddr to a FILE OFFSET (via the segment that
+	// contains it) and index into `elf` with that offset directly.
+
+	// iOS app binaries are commonly shipped as a FAT/universal container even
+	// when they hold only a single arm64 slice. Unwrap it first so `elf` below
+	// points at the start of the actual thin Mach-O slice.
+	{
+		uint32_t magic0 = *(const uint32_t*)elf;
+		constexpr uint32_t FAT_MAGIC = 0xcafebabeu;
+		constexpr uint32_t FAT_CIGAM = 0xbebafecau; // FAT_MAGIC as read on a little-endian host
+		if (magic0 == FAT_MAGIC || magic0 == FAT_CIGAM) {
+			struct FatHeader { uint32_t magic, nfat_arch; };
+			struct FatArch { uint32_t cputype, cpusubtype, offset, size, align; };
+			auto* fh = (const FatHeader*)elf;
+			uint32_t nfat = __builtin_bswap32(fh->nfat_arch);
+			auto* arch = (const FatArch*)(elf + sizeof(FatHeader));
+			uint64_t slice_offset = 0;
+			bool found = false;
+			for (uint32_t i = 0; i < nfat; i++, arch++) {
+				uint32_t cputype = __builtin_bswap32(arch->cputype);
+				if (cputype == (uint32_t)dart::mach_o::CPU_TYPE_ARM64) {
+					slice_offset = __builtin_bswap32(arch->offset);
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				throw std::invalid_argument("Mach-O: No arm64 slice found in FAT binary");
+			elf = elf + slice_offset;
+		}
 	}
+
+	auto* header = (dart::mach_o::mach_header_64*)elf;
+	if (header->magic == dart::mach_o::MH_MAGIC || header->magic == dart::mach_o::MH_CIGAM)
+		throw std::invalid_argument("Mach-O: Support only 64 bits");
+	if (header->magic == dart::mach_o::MH_CIGAM_64)
+		throw std::invalid_argument("Mach-O: Expected a host endian header");
+	if (header->magic != dart::mach_o::MH_MAGIC_64)
+		throw std::invalid_argument("Mach-O: Invalid magic header");
+
+	struct SegRange { uint64_t vmaddr, vmsize, fileoff; };
+	std::vector<SegRange> segs;
+	const dart::mach_o::symtab_command* symtab = nullptr;
+	const dart::mach_o::dysymtab_command* dysymtab = nullptr;
+
+	{
+		const uint8_t* cmd = elf + sizeof(dart::mach_o::mach_header_64);
+		for (uint32_t i = 0; i < header->ncmds; i++) {
+			auto* lc = (const dart::mach_o::load_command*)cmd;
+			if (lc->cmd == dart::mach_o::LC_SEGMENT_64) {
+				auto* seg = (const dart::mach_o::segment_command_64*)cmd;
+				segs.push_back({ seg->vmaddr, seg->vmsize, seg->fileoff });
+			} else if (lc->cmd == dart::mach_o::LC_SYMTAB) {
+				symtab = (const dart::mach_o::symtab_command*)cmd;
+			} else if (lc->cmd == dart::mach_o::LC_DYSYMTAB) {
+				dysymtab = (const dart::mach_o::dysymtab_command*)cmd;
+			}
+			cmd += lc->cmdsize;
+		}
+	}
+	if (symtab == nullptr)
+		throw std::invalid_argument("Mach-O: Could not locate symbol table.");
+	if (dysymtab == nullptr)
+		throw std::invalid_argument("Mach-O: Could not locate dynamic symbol table.");
+
+	auto vmaddrToFileOffset = [&](uint64_t vmaddr) -> uint64_t {
+		for (auto& s : segs) {
+			if (vmaddr >= s.vmaddr && vmaddr < s.vmaddr + s.vmsize)
+				return s.fileoff + (vmaddr - s.vmaddr);
+		}
+		throw std::invalid_argument("Mach-O: symbol vmaddr not within any segment");
+	};
+
+	const char* strtab = (const char*)(elf + symtab->stroff);
+	auto* nl = (const dart::mach_o::nlist*)(elf + symtab->symoff) + dysymtab->iextdefsym;
+
+	const uint8_t* vm_snapshot_data = nullptr;
+	const uint8_t* vm_snapshot_instructions = nullptr;
+	const uint8_t* isolate_snapshot_data = nullptr;
+	const uint8_t* isolate_snapshot_instructions = nullptr;
+
+	for (uint32_t i = 0; i < dysymtab->nextdefsym; i++) {
+		const char* name = strtab + nl[i].n_idx;
+		// Note: kVmSnapshotDataAsmSymbol etc. already include the leading '_'
+		// that Mach-O uses for C symbol names, so compare as-is.
+		const uint8_t** output = nullptr;
+		if (strcmp(name, kVmSnapshotDataAsmSymbol) == 0) output = &vm_snapshot_data;
+		else if (strcmp(name, kVmSnapshotInstructionsAsmSymbol) == 0) output = &vm_snapshot_instructions;
+		else if (strcmp(name, kIsolateSnapshotDataAsmSymbol) == 0) output = &isolate_snapshot_data;
+		else if (strcmp(name, kIsolateSnapshotInstructionsAsmSymbol) == 0) output = &isolate_snapshot_instructions;
+		if (output != nullptr)
+			*output = elf + vmaddrToFileOffset(nl[i].n_value);
+	}
+
+	if (vm_snapshot_data == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart VM Snapshot Data");
+	if (vm_snapshot_instructions == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart VM Snapshot Instructions");
+	if (isolate_snapshot_data == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart Isolate Snapshot Data");
+	if (isolate_snapshot_instructions == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart Isolate Snapshot Instructions");
+
+	return LibAppInfo{
+		.lib = elf,
+		.vm_snapshot_data = vm_snapshot_data,
+		.vm_snapshot_instructions = vm_snapshot_instructions,
+		.isolate_snapshot_data = isolate_snapshot_data,
+		.isolate_snapshot_instructions = isolate_snapshot_instructions,
+	};
 #else
 	const auto* hdr = (ElfHeader*)elf;
 	const auto* ident = (ElfIdent*)hdr->ident;
